@@ -17,6 +17,8 @@ from .schemas import (
     PoolOut,
     RevokeOut,
     RevokeRequest,
+    SuspensionCreate,
+    SuspensionOut,
     VerificationOut,
     VerifyRequest,
 )
@@ -171,6 +173,49 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return store.revoke_license(license_id, body.reason)
 
     # ------------------------------------------------------------------
+    # suspensions (time-limited suspension of a license)
+    # ------------------------------------------------------------------
+    @app.post(
+        "/licenses/{license_id}/suspensions",
+        response_model=SuspensionOut,
+        status_code=201,
+        tags=["suspensions"],
+    )
+    def create_suspension(license_id: int, body: SuspensionCreate):
+        """为一份授权登记限时暂停（左闭右开区间 + 非空原因）。
+
+        - 结束时刻须晚于开始时刻，否则 422；授权不存在返回 404；
+          两种拒绝均不留任何记录；
+        - 重叠的暂停区间按并集生效；登记后不可修改、不可删除；
+        - 暂停只影响登记之后提交、且场次开始时间落入区间的新核验；
+          既有核准流水与额度占用不变，幂等重放仍返回首次结果。
+        """
+        return store.create_suspension(
+            license_id=license_id,
+            start_at=body.start_at,
+            end_at=body.end_at,
+            reason=body.reason,
+        )
+
+    @app.get(
+        "/licenses/{license_id}/suspensions",
+        response_model=list[SuspensionOut],
+        tags=["suspensions"],
+    )
+    def list_suspensions(license_id: int):
+        """列出一份授权的全部暂停记录（按登记顺序）。"""
+        return store.list_suspensions(license_id=license_id)
+
+    @app.get(
+        "/suspensions/{suspension_id}",
+        response_model=SuspensionOut,
+        tags=["suspensions"],
+    )
+    def get_suspension(suspension_id: int):
+        """按暂停编号查询单条暂停记录。"""
+        return store.get_suspension(suspension_id)
+
+    # ------------------------------------------------------------------
     # verifications
     # ------------------------------------------------------------------
     @app.post("/verifications", response_model=VerificationOut, tags=["verifications"])
@@ -179,6 +224,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
         - 多份授权同时有效时只消耗一份额度，优先最早到期且自身与所绑池
           均有余额的授权；核准时授权与其池各消耗一次；
+        - 场次开始时刻处于暂停区间内的授权被跳过；覆盖该时段的未撤销
+          授权全部暂停时拒绝为 LICENSE_SUSPENDED；
         - 授权自身仍有余额、但均因所绑池耗尽而不可用时拒绝为
           POOL_EXHAUSTED；
         - 同一幂等键重试返回原结果（replay=true），请求内容变化返回 409；

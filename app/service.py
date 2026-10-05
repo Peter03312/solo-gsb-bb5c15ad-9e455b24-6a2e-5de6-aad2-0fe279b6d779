@@ -19,6 +19,7 @@ DECISION_REJECTED = "rejected"
 REASON_NO_LICENSE = "NO_LICENSE"             # 该影片+场馆没有任何授权
 REASON_TIME_OUT_OF_WINDOW = "TIME_OUT_OF_WINDOW"  # 有授权但开始时间不在任何有效时段内
 REASON_LICENSE_REVOKED = "LICENSE_REVOKED"   # 覆盖该时段的授权均已撤销
+REASON_LICENSE_SUSPENDED = "LICENSE_SUSPENDED"  # 覆盖该时段的未撤销授权全部处于暂停中
 REASON_QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"   # 授权有效但场次额度已用完
 REASON_POOL_EXHAUSTED = "POOL_EXHAUSTED"     # 授权自身有余额，但所绑影片级共享池已耗尽
 
@@ -179,7 +180,18 @@ def _verification_out(row: sqlite3.Row, replay: bool) -> dict:
     }
 
 
-def _decide(candidates: list, start_iso: str):
+def _suspension_out(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "license_id": row["license_id"],
+        "start_at": row["start_at"],
+        "end_at": row["end_at"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
+    }
+
+
+def _decide(candidates: list, start_iso: str, suspended_ids: frozenset = frozenset()):
     """Pick the license to consume, or the reason to reject.
 
     ``candidates`` is ordered by ``valid_to ASC`` so the first usable entry
@@ -188,10 +200,16 @@ def _decide(candidates: list, start_iso: str):
     own quota and its bound pool.  Exactly one unit of the chosen license
     and one unit of its pool are consumed per approval.
 
-    ``POOL_EXHAUSTED`` is reported when in-window, non-revoked licenses
-    still have their own balance but every such license is blocked only
-    because its bound pool is exhausted; the legacy reasons keep their
-    original precedence.
+    ``suspended_ids`` holds the licenses whose suspension windows cover the
+    screening start time (intervals are left-closed, right-open; overlapping
+    suspensions take effect as their union).  Suspended licenses are skipped
+    during selection.  ``LICENSE_SUSPENDED`` is reported when every
+    in-window, non-revoked license is suspended; otherwise the legacy
+    reasons keep their original precedence among the remaining licenses.
+
+    ``POOL_EXHAUSTED`` is reported when in-window, non-revoked,
+    non-suspended licenses still have their own balance but every such
+    license is blocked only because its bound pool is exhausted.
     """
     if not candidates:
         return DECISION_REJECTED, None, None, REASON_NO_LICENSE, None, None
@@ -202,7 +220,12 @@ def _decide(candidates: list, start_iso: str):
     if not active:
         return DECISION_REJECTED, None, None, REASON_LICENSE_REVOKED, None, None
 
-    own_balance = [c for c in active if c["used_sessions"] < c["max_sessions"]]
+    # 跳过开始时刻处于暂停中的授权；全部暂停时给出专门原因
+    usable = [c for c in active if c["id"] not in suspended_ids]
+    if not usable:
+        return DECISION_REJECTED, None, None, REASON_LICENSE_SUSPENDED, None, None
+
+    own_balance = [c for c in usable if c["used_sessions"] < c["max_sessions"]]
     if not own_balance:
         return DECISION_REJECTED, None, None, REASON_QUOTA_EXHAUSTED, None, None
 
@@ -432,6 +455,95 @@ class Store:
                 raise
 
     # ------------------------------------------------------------------
+    # suspensions (time-limited suspension of a license)
+    # ------------------------------------------------------------------
+    def create_suspension(
+        self,
+        *,
+        license_id: int,
+        start_at: datetime,
+        end_at: datetime,
+        reason: str,
+    ) -> dict:
+        """Register a time-limited suspension for a license.
+
+        The interval is left-closed, right-open: a screening whose start
+        time ``t`` satisfies ``start_at <= t < end_at`` is covered.
+        Overlapping suspensions of the same license take effect as their
+        union.  Records are immutable once registered.
+
+        Existence of the license and the insert happen inside one
+        ``BEGIN IMMEDIATE`` transaction, so a verification running
+        concurrently always observes either the complete state before the
+        registration or the complete state after it — never anything in
+        between.  Unknown licenses and invalid windows are rejected
+        without leaving any record behind.
+        """
+        start_iso, end_iso = to_iso(start_at), to_iso(end_at)
+        if end_iso <= start_iso:
+            raise UnprocessableError(
+                "end_at must be later than start_at",
+                code="INVALID_WINDOW",
+            )
+        with self._connection() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                lic = conn.execute(
+                    "SELECT id FROM licenses WHERE id = ?", (license_id,)
+                ).fetchone()
+                if lic is None:
+                    conn.execute("ROLLBACK")
+                    raise NotFoundError(f"license {license_id} not found")
+                created_at = now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT INTO suspensions
+                        (license_id, start_at, end_at, reason, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (license_id, start_iso, end_iso, reason, created_at),
+                )
+                conn.execute("COMMIT")
+                return {
+                    "id": cur.lastrowid,
+                    "license_id": license_id,
+                    "start_at": start_iso,
+                    "end_at": end_iso,
+                    "reason": reason,
+                    "created_at": created_at,
+                }
+            except NotFoundError:
+                raise
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def get_suspension(self, suspension_id: int) -> dict:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM suspensions WHERE id = ?", (suspension_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError(f"suspension {suspension_id} not found")
+        return _suspension_out(row)
+
+    def list_suspensions(self, *, license_id: int) -> list:
+        with self._connection() as conn:
+            lic = conn.execute(
+                "SELECT id FROM licenses WHERE id = ?", (license_id,)
+            ).fetchone()
+            if lic is None:
+                raise NotFoundError(f"license {license_id} not found")
+            rows = conn.execute(
+                "SELECT * FROM suspensions WHERE license_id = ? ORDER BY id ASC",
+                (license_id,),
+            ).fetchall()
+        return [_suspension_out(r) for r in rows]
+
+    # ------------------------------------------------------------------
     # verifications
     # ------------------------------------------------------------------
     def verify(
@@ -477,10 +589,22 @@ class Store:
                     """,
                     (film_id, venue_id),
                 ).fetchall()
+                # 场次开始时刻落入任一暂停区间（左闭右开）的授权被跳过；
+                # 与候选查询同事务读取，决定必然对应某个完整的登记状态
+                suspended_ids = frozenset(
+                    r["license_id"]
+                    for r in conn.execute(
+                        """
+                        SELECT DISTINCT license_id FROM suspensions
+                        WHERE start_at <= ? AND ? < end_at
+                        """,
+                        (start_iso, start_iso),
+                    ).fetchall()
+                )
                 (
                     decision, license_id, pool_id, reason,
                     remaining, pool_remaining,
-                ) = _decide(candidates, start_iso)
+                ) = _decide(candidates, start_iso, suspended_ids)
 
                 created_at = now_iso()
                 cur = conn.execute(

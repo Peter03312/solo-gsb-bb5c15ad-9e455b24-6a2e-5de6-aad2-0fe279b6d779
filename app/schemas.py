@@ -92,6 +92,37 @@ class RevokeOut(BaseModel):
     revoked_at: str
 
 
+class SuspensionCreate(BaseModel):
+    start_at: datetime = Field(
+        description="暂停开始时刻（区间左闭，含该时刻），ISO-8601；不带时区按 UTC 处理",
+        examples=["2026-10-05T00:00:00Z"],
+    )
+    end_at: datetime = Field(
+        description="暂停结束时刻（区间右开，不含该时刻），须晚于开始时刻",
+        examples=["2026-10-06T12:00:00Z"],
+    )
+    reason: str = Field(
+        min_length=1, max_length=500,
+        description="暂停原因（非空）",
+        examples=["版权方临时下架整改"],
+    )
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "SuspensionCreate":
+        if self.end_at <= self.start_at:
+            raise ValueError("end_at must be later than start_at")
+        return self
+
+
+class SuspensionOut(BaseModel):
+    id: int = Field(description="暂停编号")
+    license_id: int
+    start_at: str = Field(description="暂停开始（含），UTC ISO-8601")
+    end_at: str = Field(description="暂停结束（不含），UTC ISO-8601")
+    reason: str
+    created_at: str
+
+
 class VerifyRequest(BaseModel):
     film_id: str = Field(min_length=1, max_length=128)
     venue_id: str = Field(min_length=1, max_length=128)
@@ -119,7 +150,7 @@ class VerificationOut(BaseModel):
     )
     reject_reason: Optional[str] = Field(
         description="拒绝原因：NO_LICENSE / TIME_OUT_OF_WINDOW / LICENSE_REVOKED / "
-                    "QUOTA_EXHAUSTED / POOL_EXHAUSTED"
+                    "LICENSE_SUSPENDED / QUOTA_EXHAUSTED / POOL_EXHAUSTED"
     )
     remaining_quota: Optional[int] = Field(description="本次消耗后该授权自身的剩余额度")
     pool_remaining_quota: Optional[int] = Field(
