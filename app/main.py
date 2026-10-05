@@ -17,6 +17,8 @@ from .schemas import (
     PoolOut,
     RevokeOut,
     RevokeRequest,
+    SuspensionCreate,
+    SuspensionOut,
     VerificationOut,
     VerifyRequest,
 )
@@ -62,8 +64,8 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
     app = FastAPI(
         title="Film Festival Screening License Service",
-        version="1.0.0",
-        description="电影节片源放映许可核验：授权录入、幂等核验、额度控制与撤销追溯",
+        version="1.1.0",
+        description="电影节片源放映许可核验：授权录入、限时暂停、幂等核验、额度控制与撤销追溯",
         lifespan=lifespan,
     )
     app.state.store = store
@@ -96,7 +98,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     def root():
         return {
             "service": "film-festival-licensing",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "docs": "/docs",
             "health": "/health",
         }
@@ -171,6 +173,55 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return store.revoke_license(license_id, body.reason)
 
     # ------------------------------------------------------------------
+    # time-limited suspensions
+    # ------------------------------------------------------------------
+    @app.post(
+        "/licenses/{license_id}/suspensions",
+        response_model=SuspensionOut,
+        status_code=201,
+        tags=["suspensions"],
+    )
+    def create_suspension(license_id: int, body: SuspensionCreate):
+        """为一份授权登记限时暂停（左闭右开区间 [suspend_from, suspend_to)）。
+
+        - 起止时刻必须带时区偏移，且结束严格晚于开始；授权不存在返回 404；
+        - 区间可重叠，核验时按并集生效；记录一经登记不可修改、不可删除；
+        - 暂停只影响此后提交、且场次开始时间落入区间的新核验，已存在的
+          核准流水及其额度/池占用不受影响。
+        """
+        return store.create_suspension(
+            license_id,
+            suspend_from=body.suspend_from,
+            suspend_to=body.suspend_to,
+            reason=body.reason,
+        )
+
+    @app.get(
+        "/licenses/{license_id}/suspensions",
+        response_model=list[SuspensionOut],
+        tags=["suspensions"],
+    )
+    def list_license_suspensions(license_id: int):
+        """列出单份授权的全部暂停记录（按登记次序）；授权不存在返回 404。"""
+        store.get_license(license_id)  # 404 when the license is unknown
+        return store.list_suspensions(license_id=license_id)
+
+    @app.get("/suspensions", response_model=list[SuspensionOut], tags=["suspensions"])
+    def list_suspensions(
+        license_id: Optional[int] = Query(default=None),
+    ):
+        """列出全部暂停记录，可按 license_id 过滤；记录登记后不可改。"""
+        return store.list_suspensions(license_id=license_id)
+
+    @app.get(
+        "/suspensions/{suspension_id}",
+        response_model=SuspensionOut,
+        tags=["suspensions"],
+    )
+    def get_suspension(suspension_id: int):
+        return store.get_suspension(suspension_id)
+
+    # ------------------------------------------------------------------
     # verifications
     # ------------------------------------------------------------------
     @app.post("/verifications", response_model=VerificationOut, tags=["verifications"])
@@ -179,8 +230,9 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
 
         - 多份授权同时有效时只消耗一份额度，优先最早到期且自身与所绑池
           均有余额的授权；核准时授权与其池各消耗一次；
-        - 授权自身仍有余额、但均因所绑池耗尽而不可用时拒绝为
-          POOL_EXHAUSTED；
+        - 暂停中的授权（场次开始时间落入某暂停区间，左闭右开、重叠取并集）
+          不参与选择；覆盖该时段且未撤销的授权全部暂停时，拒绝原因为
+          LICENSE_SUSPENDED；否则跳过暂停授权后沿用原有拒绝原因及次序；
         - 同一幂等键重试返回原结果（replay=true），请求内容变化返回 409；
         - 拒绝时 decision=rejected 并给出 reject_reason。
         """

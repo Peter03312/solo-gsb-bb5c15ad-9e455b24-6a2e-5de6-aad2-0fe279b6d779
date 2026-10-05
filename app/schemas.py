@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class PoolCreate(BaseModel):
@@ -92,6 +92,42 @@ class RevokeOut(BaseModel):
     revoked_at: str
 
 
+class SuspensionCreate(BaseModel):
+    suspend_from: datetime = Field(
+        description="暂停起（含），ISO-8601 且必须带时区偏移，如 2026-10-05T00:00:00+08:00",
+        examples=["2026-10-05T00:00:00+08:00"],
+    )
+    suspend_to: datetime = Field(
+        description="暂停止（不含），ISO-8601 且必须带时区偏移，须严格晚于 suspend_from",
+        examples=["2026-10-06T00:00:00+08:00"],
+    )
+    reason: str = Field(min_length=1, max_length=500, examples=["版权方临时通知暂停放映"])
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("reason must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "SuspensionCreate":
+        if self.suspend_from.tzinfo is None or self.suspend_to.tzinfo is None:
+            raise ValueError("suspend_from and suspend_to must include a timezone offset")
+        if self.suspend_to <= self.suspend_from:
+            raise ValueError("suspend_to must be later than suspend_from")
+        return self
+
+
+class SuspensionOut(BaseModel):
+    id: int = Field(description="暂停编号")
+    license_id: int
+    suspend_from: str = Field(description="暂停起（含），统一存储为 UTC")
+    suspend_to: str = Field(description="暂停止（不含），统一存储为 UTC")
+    reason: str
+    created_at: str
+
+
 class VerifyRequest(BaseModel):
     film_id: str = Field(min_length=1, max_length=128)
     venue_id: str = Field(min_length=1, max_length=128)
@@ -119,7 +155,7 @@ class VerificationOut(BaseModel):
     )
     reject_reason: Optional[str] = Field(
         description="拒绝原因：NO_LICENSE / TIME_OUT_OF_WINDOW / LICENSE_REVOKED / "
-                    "QUOTA_EXHAUSTED / POOL_EXHAUSTED"
+                    "LICENSE_SUSPENDED / QUOTA_EXHAUSTED / POOL_EXHAUSTED"
     )
     remaining_quota: Optional[int] = Field(description="本次消耗后该授权自身的剩余额度")
     pool_remaining_quota: Optional[int] = Field(

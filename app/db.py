@@ -36,6 +36,18 @@ CREATE TABLE IF NOT EXISTS revocations (
     revoked_at  TEXT    NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS suspensions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_id  INTEGER NOT NULL REFERENCES licenses (id),
+    suspend_from TEXT   NOT NULL,               -- 左闭，canonical UTC ISO-8601
+    suspend_to   TEXT   NOT NULL,               -- 右开，canonical UTC ISO-8601
+    reason      TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL
+);
+-- 核验在写事务内按 license_id + 场次时间做左闭右开命中查询
+CREATE INDEX IF NOT EXISTS idx_suspensions_license_window
+    ON suspensions (license_id, suspend_from, suspend_to);
+
 CREATE TABLE IF NOT EXISTS verifications (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     idempotency_key TEXT    NOT NULL UNIQUE,
